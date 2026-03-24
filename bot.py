@@ -1,14 +1,17 @@
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+import os
 import asyncio
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
-# 🔑 Bot tokenini bu yerga qo'y
-API_TOKEN = '8106728301:AAEq9OvTowwzbigPMCcAGfJVLqtO1UGmaJY'
+# ---------------------------
+# KONFIGURATSIYA (Railway Variables uchun)
+# ---------------------------
+API_TOKEN = os.getenv('BOT_TOKEN')  # Railway'dagi tokenni oladi
 
 logging.basicConfig(level=logging.INFO)
 
@@ -16,9 +19,11 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 # ---------------------------
-# DATABASE
+# DATABASE (Ma'lumotlar bazasi)
 # ---------------------------
-conn = sqlite3.connect('data.db')
+# Railway'da fayllar adashib ketmasligi uchun joriy papkadan olamiz
+db_path = os.path.join(os.getcwd(), 'data.db')
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -26,143 +31,140 @@ CREATE TABLE IF NOT EXISTS cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
     content TEXT,
-    review_1 TEXT,  -- ertaga
+    review_1 TEXT,  -- 1 kundan keyin
     review_2 TEXT,  -- 7 kundan keyin
     review_3 TEXT,  -- 30 kundan keyin
-    extra_review TEXT  -- qiyin bo‘ldi uchun keyingi kun
+    extra_review TEXT  -- 'Qiyin bo'ldi' uchun keyingi kun
 )
 """)
 conn.commit()
 
+
 # ---------------------------
-# START COMMAND
+# KOMANDALAR
 # ---------------------------
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     name = message.from_user.first_name
     await message.reply(
-        f"Salom, {name}! 📚\n\nYangi bilim qo‘shish uchun /add yozing.\nMen sizga o‘zim eslataman!"
+        f"Salom, {name}! 📚\n\nMen Spaced Repetition (1-7-30) botiman.\n"
+        f"Yangi bilim qo‘shish uchun /add yozing."
     )
 
-# ---------------------------
-# ADD COMMAND
-# ---------------------------
+
 @dp.message_handler(commands=['add'])
-async def add(message: types.Message):
-    await message.reply("✍️ Yangi o‘rgangan narsani yozing:")
+async def add_prompt(message: types.Message):
+    await message.reply("✍️ Yangi o‘rgangan ma'lumotni yozing:")
+
 
 # ---------------------------
-# SAVE CONTENT
+# MA'LUMOTNI SAQLASH
 # ---------------------------
-@dp.message_handler()
-async def save(message: types.Message):
+@dp.message_handler(lambda message: not message.text.startswith('/'))
+async def save_content(message: types.Message):
     user_id = message.from_user.id
     content = message.text
 
     today = datetime.now()
-    review_1 = today + timedelta(days=1)
-    review_2 = today + timedelta(days=7)
-    review_3 = today + timedelta(days=30)
+    r1 = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    r2 = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+    r3 = (today + timedelta(days=30)).strftime("%Y-%m-%d")
 
     cursor.execute(
-        "INSERT INTO cards (user_id, content, review_1, review_2, review_3, extra_review) VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, content,
-         review_1.strftime("%Y-%m-%d"),
-         review_2.strftime("%Y-%m-%d"),
-         review_3.strftime("%Y-%m-%d"),
-         None)
+        "INSERT INTO cards (user_id, content, review_1, review_2, review_3) VALUES (?, ?, ?, ?, ?)",
+        (user_id, content, r1, r2, r3)
     )
     conn.commit()
 
-    await message.reply("✅ Saqlandi! ⏰ Ertaga, 7 kundan keyin va 30 kundan keyin eslataman.")
+    await message.reply(f"✅ Saqlandi!\n⏰ Eslatmalar: {r1}, {r2} va {r3} sanalarida yuboriladi.")
+
 
 # ---------------------------
-# REVIEW BUTTONS
+# TUGMALAR VA TEKSHIRUV
 # ---------------------------
-def get_buttons(card_id):
-    kb = InlineKeyboardMarkup()
+def get_review_keyboard(card_id):
+    kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("✅ Esladim", callback_data=f"good_{card_id}"),
         InlineKeyboardButton("❌ Qiyin bo‘ldi", callback_data=f"bad_{card_id}")
     )
     return kb
 
-# ---------------------------
-# SEND REVIEWS
-# ---------------------------
+
 async def send_reviews(user_id):
     today_str = datetime.now().strftime("%Y-%m-%d")
 
+    # Bugun takrorlanishi kerak bo'lgan hamma narsani qidiramiz
     cursor.execute(
-        "SELECT * FROM cards WHERE user_id=? AND (review_1=? OR review_2=? OR review_3=? OR extra_review=?)",
+        "SELECT id, content FROM cards WHERE user_id=? AND (review_1=? OR review_2=? OR review_3=? OR extra_review=?)",
         (user_id, today_str, today_str, today_str, today_str)
     )
     rows = cursor.fetchall()
 
-    if not rows:
-        await bot.send_message(user_id, "📭 Bugun takrorlash yo‘q.")
-        return
-
     for row in rows:
-        card_id = row[0]
-        content = row[2]
-
+        card_id, content = row
         await bot.send_message(
             user_id,
-            f"📚 Bugun takrorlash vaqti!\n\n{content}",
-            reply_markup=get_buttons(card_id)
+            f"📚 **Bugun takrorlash vaqti!**\n\n{content}",
+            reply_markup=get_review_keyboard(card_id),
+            parse_mode="Markdown"
         )
+        # Bugungi extra_review'ni o'chirib qo'yamiz (agar u orqali kelgan bo'lsa)
+        cursor.execute("UPDATE cards SET extra_review=NULL WHERE id=? AND extra_review=?", (card_id, today_str))
 
-    # Bugun yuborilgan extra_review bo‘shatilsin
-    cursor.execute(
-        "UPDATE cards SET extra_review=NULL WHERE extra_review=?",
-        (today_str,)
-    )
     conn.commit()
 
+
 # ---------------------------
-# BUTTON HANDLER
+# TUGMA BOSILGANDA
 # ---------------------------
-@dp.callback_query_handler(lambda c: True)
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(('good_', 'bad_')))
 async def process_callback(callback_query: types.CallbackQuery):
-    data = callback_query.data
-    action, card_id = data.split("_")
-    card_id = int(card_id)
+    action, card_id = callback_query.data.split("_")
 
     if action == "bad":
-        # Qiyin bo‘ldi → keyingi kunga qo‘shish
+        # Qiyin bo'ldi -> Ertaga qaytadan eslatadi
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        cursor.execute(
-            "UPDATE cards SET extra_review=? WHERE id=?",
-            (tomorrow, card_id)
-        )
+        cursor.execute("UPDATE cards SET extra_review=? WHERE id=?", (tomorrow, card_id))
         conn.commit()
+        await callback_query.message.edit_text(
+            f"❌ Qiyin bo'ldi. Ertaga yana eslataman!\n\n{callback_query.message.text}")
+    else:
+        # Esladim -> Shunchaki xabarni o'chiradi yoki tasdiqlaydi
+        await callback_query.message.edit_text(f"✅ Zo'r! O'rganishda davom eting.\n\n{callback_query.message.text}")
 
-    await callback_query.answer("✅ Yangilandi")
-# ---------------------------
+    await callback_query.answer()
 
-# MANUAL CHECK (optional)
-# ---------------------------
-@dp.message_handler(commands=['check'])
-async def check_now(message: types.Message):
-    await send_reviews(message.from_user.id)
 
 # ---------------------------
-# AUTOMATIC DAILY CHECKER
+# AVTOMATIK TEKSHIRUV (SCHEDULER)
 # ---------------------------
-async def scheduler():
+async def daily_scheduler():
     while True:
+        # Har 1 soatda bazani tekshirib chiqadi
         cursor.execute("SELECT DISTINCT user_id FROM cards")
         users = cursor.fetchall()
         for user in users:
-            await send_reviews(user[0])
-        await asyncio.sleep(86400)  # 24 soat = 86400 soniya
+            try:
+                await send_reviews(user[0])
+            except Exception as e:
+                logging.error(f"Xatolik yuz berdi: {e}")
 
-async def on_startup(dp):
-    asyncio.create_task(scheduler())
+        await asyncio.sleep(3600)  # 3600 soniya = 1 soat
+
+
+async def on_startup(_):
+    asyncio.create_task(daily_scheduler())
+
+
+@dp.message_handler(commands=['check'])
+async def manual_check(message: types.Message):
+    await send_reviews(message.from_user.id)
+
 
 # ---------------------------
-# RUN BOT
+# ISHGA TUSHIRISH
 # ---------------------------
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
