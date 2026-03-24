@@ -11,7 +11,9 @@ from aiogram.utils import executor
 # ---------------------------
 # KONFIGURATSIYA (Railway Variables uchun)
 # ---------------------------
-API_TOKEN = os.getenv('BOT_TOKEN')  # Railway'dagi tokenni oladi
+# os.getenv yozuvini o'chiring va tokenni qo'shing
+API_TOKEN = '8106728301:AAEq9OvTowwzbigPMCcAGfJVLqtO1UGmaJY'
+# Railway'dagi tokenni oladi
 
 logging.basicConfig(level=logging.INFO)
 
