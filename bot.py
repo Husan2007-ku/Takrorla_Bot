@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from aiogram.utils import executor
 
 # ---------------------------
-# KONFIGURATSIYA (Tokeningiz shu yerda)
+# KONFIGURATSIYA
 # ---------------------------
 API_TOKEN = '8106728301:AAEq9OvTowwzbigPMCcAGfJVLqtO1UGmaJY'
 
@@ -29,28 +29,24 @@ CREATE TABLE IF NOT EXISTS cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
     content TEXT,
-    review_1 TEXT,  -- 1 kundan keyin
-    review_2 TEXT,  -- 7 kundan keyin
-    review_3 TEXT,  -- 30 kundan keyin
-    extra_review TEXT  -- 'Qiyin bo'ldi' uchun keyingi kun
+    review_1 TEXT,
+    review_2 TEXT,
+    review_3 TEXT,
+    extra_review TEXT
 )
 """)
 conn.commit()
 
-
 # ---------------------------
-# TUGMALAR (KEYBOARDS)
+# TUGMALAR (MENYU)
 # ---------------------------
 
-# Asosiy doimiy menyu tugmalari
 def main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("➕ Yangi qo'shish"))
     kb.add(KeyboardButton("🔍 Bugun nima bor?"))
     return kb
 
-
-# Takrorlash paytidagi inline tugmalar
 def get_review_keyboard(card_id):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -59,41 +55,45 @@ def get_review_keyboard(card_id):
     )
     return kb
 
-
 # ---------------------------
-# KOMANDALAR VA TUGMA BOSILISHI
+# START KOMANDASI (TANISHTIRUV)
 # ---------------------------
 
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     name = message.from_user.first_name
-    await message.reply(
-        f"Salom, {name}! 📚\n\nMenyu orqali botni oson ishlatishingiz mumkin:",
-        reply_markup=main_menu()
+    intro_text = (
+        f"Salom, {name}! 😊\n\n"
+        f"Men **Spaced Repetition** (Interval takrorlash) botiman. 🧠\n\n"
+        f"**Vazifam:** Siz o‘rgangan yangi ma’lumotlarni unutilmas qilib xotirangizga muhrlash.\n\n"
+        f"**Qanday ishlayman?**\n"
+        f"1️⃣ Siz menga biror ma’lumot yuborasiz.\n"
+        f"2️⃣ Men uni 1 kundan keyin, 7 kundan keyin va 30 kundan keyin eslataman.\n"
+        f"3️⃣ Agar takrorlash paytida 'Qiyin bo‘ldi'ni bossangiz, ertaga yana so‘rayman.\n\n"
+        f"Pastdagi menyu orqali ishlashni boshlashingiz mumkin! 👇"
     )
+    await message.reply(intro_text, reply_markup=main_menu(), parse_mode="Markdown")
 
+# ---------------------------
+# TUGMALAR LOGIKASI
+# ---------------------------
 
-# "Yangi qo'shish" tugmasi bosilganda
 @dp.message_handler(lambda message: message.text == "➕ Yangi qo'shish")
 async def add_btn(message: types.Message):
-    await message.reply("✍️ Yangi o‘rgangan ma'lumotni yozing (matn yuboring):")
+    await message.reply("✍️ Marhamat, yangi o‘rgangan ma’lumotingizni yozib yuboring:")
 
-
-# "Bugun nima bor?" tugmasi bosilganda
 @dp.message_handler(lambda message: message.text == "🔍 Bugun nima bor?")
 async def check_btn(message: types.Message):
     await send_reviews(message.from_user.id)
 
+# ---------------------------
+# SAQLASH VA TAKRORLASH
+# ---------------------------
 
-# ---------------------------
-# MA'LUMOTNI SAQLASH (TEXT HANDLER)
-# ---------------------------
-# Bu handler buyruqlar va tugmalardan boshqa barcha matnlarni bazaga saqlaydi
 @dp.message_handler(lambda message: not message.text.startswith(('/', '➕', '🔍')))
 async def save_content(message: types.Message):
     user_id = message.from_user.id
     content = message.text
-
     today = datetime.now()
     r1 = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     r2 = (today + timedelta(days=7)).strftime("%Y-%m-%d")
@@ -106,17 +106,16 @@ async def save_content(message: types.Message):
     conn.commit()
 
     await message.reply(
-        f"✅ Saqlandi!\n⏰ Eslatmalar: {r1}, {r2} va {r3} sanalarida yuboriladi.",
+        f"✅ Muvaffaqiyatli saqlandi!\n\n"
+        f"⏰ Sizga buni quyidagi sanalarda eslataman:\n"
+        f"📅 1-takrorlash: {r1}\n"
+        f"📅 2-takrorlash: {r2}\n"
+        f"📅 3-takrorlash: {r3}",
         reply_markup=main_menu()
     )
 
-
-# ---------------------------
-# TAKRORLASH VA TUGMALAR LOGIKASI
-# ---------------------------
 async def send_reviews(user_id):
     today_str = datetime.now().strftime("%Y-%m-%d")
-
     cursor.execute(
         "SELECT id, content FROM cards WHERE user_id=? AND (review_1=? OR review_2=? OR review_3=? OR extra_review=?)",
         (user_id, today_str, today_str, today_str, today_str)
@@ -124,65 +123,48 @@ async def send_reviews(user_id):
     rows = cursor.fetchall()
 
     if not rows:
-        # Agar tugma orqali bosilgan bo'lsa xabar beramiz
-        await bot.send_message(user_id, "📭 Bugun takrorlash uchun hech narsa yo'q.")
+        await bot.send_message(user_id, "📭 Bugun takrorlash uchun ma’lumotlar yo‘q. Yangi narsalar o‘rganishda davom eting!")
         return
 
     for row in rows:
         card_id, content = row
         await bot.send_message(
             user_id,
-            f"📚 **Bugun takrorlash vaqti!**\n\n{content}",
+            f"📚 **Takrorlash vaqti keldi!**\n\n{content}",
             reply_markup=get_review_keyboard(card_id),
             parse_mode="Markdown"
         )
-        # Bugun ko'rsatilgan 'extra_review' ni tozalaymiz
         cursor.execute("UPDATE cards SET extra_review=NULL WHERE id=? AND extra_review=?", (card_id, today_str))
-
     conn.commit()
-
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(('good_', 'bad_')))
 async def process_callback(callback_query: types.CallbackQuery):
     action, card_id = callback_query.data.split("_")
-
     if action == "bad":
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         cursor.execute("UPDATE cards SET extra_review=? WHERE id=?", (tomorrow, card_id))
         conn.commit()
-        await callback_query.message.edit_text(
-            f"❌ Qiyin bo'ldi. Ertaga yana eslataman!\n\n{callback_query.message.text}")
+        await callback_query.message.edit_text(f"❌ Qiyin bo‘ldi. Ertaga buni yana bir bor so‘rayman!\n\n{callback_query.message.text}")
     else:
-        await callback_query.message.edit_text(f"✅ Zo'r! O'rganishda davom eting.\n\n{callback_query.message.text}")
-
+        await callback_query.message.edit_text(f"✅ Ajoyib! Bilimingiz mustahkamlanmoqda.\n\n{callback_query.message.text}")
     await callback_query.answer()
 
-
-# ---------------------------
-# AVTOMATIK SCHEDULER
-# ---------------------------
 async def daily_scheduler():
     while True:
         cursor.execute("SELECT DISTINCT user_id FROM cards")
         users = cursor.fetchall()
         for user in users:
             try:
-                # user bu tuple (user_id,) shaklida keladi
                 await send_reviews(user[0])
             except Exception as e:
                 logging.error(f"Xatolik: {e}")
-
-        await asyncio.sleep(3600)  # Har 1 soatda tekshiradi
-
+        await asyncio.sleep(3600) # Har soatda tekshirish
 
 async def on_startup(_):
     asyncio.create_task(daily_scheduler())
 
-
-# ---------------------------
-# ISHGA TUSHIRISH
-# ---------------------------
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
 
 
