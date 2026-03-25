@@ -135,7 +135,7 @@ async def send_reviews(user_id):
             reply_markup=get_review_keyboard(card_id),
             parse_mode="Markdown"
         )
-        cursor.execute("UPDATE cards SET extra_review=NULL WHERE id=? ", ( today_str, card_id))
+        cursor.execute("UPDATE cards SET extra_review=NULL, WHERE id=? " (card_id, today_str))
     conn.commit()
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(('good_', 'bad_')))
@@ -143,7 +143,7 @@ async def process_callback(callback_query: types.CallbackQuery):
     action, card_id = callback_query.data.split("_")
     if action == "bad":
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        cursor.execute("UPDATE cards SET extra_review=NULL, WHERE id=?", (tomorrow, card_id))
+        cursor.execute("UPDATE cards SET extra_review=NULL, WHERE id=?" (tomorrow, card_id))
         conn.commit()
         await callback_query.message.edit_text(f"❌ Qiyin bo‘ldi. Ertaga buni yana bir bor so‘rayman!\n\n{callback_query.message.text}")
     else:
