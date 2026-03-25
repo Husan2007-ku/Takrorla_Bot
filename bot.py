@@ -65,12 +65,12 @@ async def start(message: types.Message):
     name = message.from_user.first_name
     intro_text = (
         f"Salom, {name}! 😊\n\n"
-        f"Men **Spaced Repetition** (Interval takrorlash) botiman. 🧠\n\n"
-        f"**Vazifam:** Siz o‘rgangan yangi ma’lumotlarni unutilmas qilib xotirangizga muhrlash.\n\n"
-        f"**Qanday ishlayman?**\n"
+        f"Men *Spaced Repetition* (Interval takrorlash) botiman. 🧠\n\n"
+        f"*Vazifam:* Siz o‘rgangan yangi ma’lumotlarni unutilmas qilib xotirangizga muhrlash.\n\n"
+        f"*Qanday ishlayman?*\n"
         f"1️⃣ Siz menga biror ma’lumot yuborasiz.\n"
         f"2️⃣ Men uni 1 kundan keyin, 7 kundan keyin va 30 kundan keyin eslataman.\n"
-        f"3️⃣ Agar takrorlash paytida 'Qiyin bo‘ldi'ni bossangiz, ertaga yana so‘rayman.\n\n"
+        f"3️⃣ Agar 'Qiyin bo‘ldi'ni bossangiz, ertaga yana so‘rayman.\n\n"
         f"Pastdagi menyu orqali ishlashni boshlashingiz mumkin! 👇"
     )
     await message.reply(intro_text, reply_markup=main_menu(), parse_mode="Markdown")
@@ -115,6 +115,10 @@ async def save_content(message: types.Message):
         reply_markup=main_menu()
     )
 
+# ---------------------------
+# TAKRORLASH
+# ---------------------------
+
 async def send_reviews(user_id):
     today_str = datetime.now().strftime("%Y-%m-%d")
     cursor.execute(
@@ -131,24 +135,46 @@ async def send_reviews(user_id):
         card_id, content = row
         await bot.send_message(
             user_id,
-            f"📚 **Takrorlash vaqti keldi!**\n\n{content}",
-            reply_markup=get_review_keyboard(card_id),
-            parse_mode="Markdown"
+            f"📚 Takrorlash vaqti keldi!\n\n{content}",
+            reply_markup=get_review_keyboard(card_id)
         )
-        cursor.execute("UPDATE cards SET extra_review=NULL, WHERE id=? " (card_id, today_str))
+
+        # 🔥 TUZATILDI
+        cursor.execute(
+            "UPDATE cards SET last_sent=? WHERE id=?",
+            (today_str, card_id)
+        )
+
     conn.commit()
+
+# ---------------------------
+# CALLBACK
+# ---------------------------
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(('good_', 'bad_')))
 async def process_callback(callback_query: types.CallbackQuery):
     action, card_id = callback_query.data.split("_")
+
     if action == "bad":
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        cursor.execute("UPDATE cards SET extra_review=NULL, WHERE id=?" (tomorrow, card_id))
+
+        # 🔥 TUZATILDI
+        cursor.execute(
+            "UPDATE cards SET extra_review=? WHERE id=?",
+            (tomorrow, card_id)
+        )
         conn.commit()
-        await callback_query.message.edit_text(f"❌ Qiyin bo‘ldi. Ertaga buni yana bir bor so‘rayman!\n\n{callback_query.message.text}")
+
+        await callback_query.message.edit_text("❌ Qiyin bo‘ldi. Ertaga yana chiqadi!")
+
     else:
-        await callback_query.message.edit_text(f"✅ Ajoyib! Bilimingiz mustahkamlanmoqda.\n\n{callback_query.message.text}")
+        await callback_query.message.edit_text("✅ Ajoyib! Bilimingiz mustahkamlanmoqda.")
+
     await callback_query.answer()
+
+# ---------------------------
+# SCHEDULER
+# ---------------------------
 
 async def daily_scheduler():
     while True:
@@ -163,6 +189,10 @@ async def daily_scheduler():
 
 async def on_startup(_):
     asyncio.create_task(daily_scheduler())
+
+# ---------------------------
+# RUN
+# ---------------------------
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
