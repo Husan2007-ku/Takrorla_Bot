@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS cards (
     review_1 TEXT,
     review_2 TEXT,
     review_3 TEXT,
-    extra_review TEXT
+    extra_review TEXT,
+    last_sent TEXT
 )
 """)
 conn.commit()
@@ -117,13 +118,14 @@ async def save_content(message: types.Message):
 async def send_reviews(user_id):
     today_str = datetime.now().strftime("%Y-%m-%d")
     cursor.execute(
-        "SELECT id, content FROM cards WHERE user_id=? AND (review_1=? OR review_2=? OR review_3=? OR extra_review=?)",
-        (user_id, today_str, today_str, today_str, today_str)
+        "SELECT id, content FROM cards WHERE user_id=? AND (review_1=? OR review_2=? OR review_3=? OR extra_review=?) AND (last_sent IS NULL OR last_sent!=?)",
+        (user_id, today_str, today_str, today_str, today_str, today_str)
     )
     rows = cursor.fetchall()
 
     if not rows:
         await bot.send_message(user_id, "📭 Bugun takrorlash uchun ma’lumotlar yo‘q. Yangi narsalar o‘rganishda davom eting!")
+
         return
 
     for row in rows:
@@ -134,7 +136,7 @@ async def send_reviews(user_id):
             reply_markup=get_review_keyboard(card_id),
             parse_mode="Markdown"
         )
-        cursor.execute("UPDATE cards SET extra_review=NULL WHERE id=? AND extra_review=?", (card_id, today_str))
+        cursor.execute("UPDATE cards SET extra_review=NULL WHERE id=? ", ( today_str, card_id))
     conn.commit()
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(('good_', 'bad_')))
@@ -142,7 +144,7 @@ async def process_callback(callback_query: types.CallbackQuery):
     action, card_id = callback_query.data.split("_")
     if action == "bad":
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        cursor.execute("UPDATE cards SET extra_review=? WHERE id=?", (tomorrow, card_id))
+        cursor.execute("UPDATE cards SET extra_review=NULL, WHERE id=?", (tomorrow, card_id))
         conn.commit()
         await callback_query.message.edit_text(f"❌ Qiyin bo‘ldi. Ertaga buni yana bir bor so‘rayman!\n\n{callback_query.message.text}")
     else:
@@ -158,7 +160,7 @@ async def daily_scheduler():
                 await send_reviews(user[0])
             except Exception as e:
                 logging.error(f"Xatolik: {e}")
-        await asyncio.sleep(3600) # Har soatda tekshirish
+        await asyncio.sleep(86400) # Har kuni
 
 async def on_startup(_):
     asyncio.create_task(daily_scheduler())
