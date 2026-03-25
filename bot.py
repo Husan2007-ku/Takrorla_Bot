@@ -125,7 +125,6 @@ async def send_reviews(user_id):
 
     if not rows:
         await bot.send_message(user_id, "📭 Bugun takrorlash uchun ma’lumotlar yo‘q. Yangi narsalar o‘rganishda davom eting!")
-
         return
 
     for row in rows:
