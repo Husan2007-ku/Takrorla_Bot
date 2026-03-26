@@ -96,7 +96,9 @@ async def save_content(message: types.Message):
     user_id = message.from_user.id
     content = message.text
     today = datetime.now()
-    r1 = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # ✅ TEST UCHUN: 1-karta bugun chiqsin
+    r1 = today.strftime("%Y-%m-%d")  # 1-takrorlash bugun
     r2 = (today + timedelta(days=7)).strftime("%Y-%m-%d")
     r3 = (today + timedelta(days=30)).strftime("%Y-%m-%d")
 
