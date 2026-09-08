@@ -3,6 +3,8 @@ import sqlite3
 import os
 import random
 import asyncio
+import csv
+import io
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -447,6 +449,42 @@ async def admin_stats(message: types.Message):
         f"🆕 Bugun qo'shilgan: {new_today}\n"
         f"🗂 Jami karta: {total_cards}"
     )
+
+
+@dp.message_handler(commands=['export'])
+async def export_data(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return  # admin bo'lmagan foydalanuvchiga hech narsa qaytarilmaydi
+
+    # --- users.csv ---
+    cursor.execute(
+        "SELECT user_id, username, first_name, joined_at, reminder_hour, referred_by, reviews_sent_count FROM users ORDER BY joined_at"
+    )
+    users_rows = cursor.fetchall()
+
+    users_buf = io.StringIO()
+    writer = csv.writer(users_buf)
+    writer.writerow(["user_id", "username", "first_name", "joined_at", "reminder_hour", "referred_by", "reviews_sent_count"])
+    writer.writerows(users_rows)
+    users_bytes = io.BytesIO(users_buf.getvalue().encode("utf-8-sig"))
+    users_bytes.name = "users.csv"
+
+    # --- cards.csv ---
+    cursor.execute(
+        "SELECT id, user_id, content, ease_factor, interval_days, reps, due_date, created_at FROM cards ORDER BY user_id, id"
+    )
+    cards_rows = cursor.fetchall()
+
+    cards_buf = io.StringIO()
+    writer = csv.writer(cards_buf)
+    writer.writerow(["id", "user_id", "content", "ease_factor", "interval_days", "reps", "due_date", "created_at"])
+    writer.writerows(cards_rows)
+    cards_bytes = io.BytesIO(cards_buf.getvalue().encode("utf-8-sig"))
+    cards_bytes.name = "cards.csv"
+
+    await message.reply(f"📤 Eksport: {len(users_rows)} foydalanuvchi, {len(cards_rows)} karta.")
+    await bot.send_document(message.from_user.id, types.InputFile(users_bytes, filename="users.csv"))
+    await bot.send_document(message.from_user.id, types.InputFile(cards_bytes, filename="cards.csv"))
 
 
 # ---------------------------
