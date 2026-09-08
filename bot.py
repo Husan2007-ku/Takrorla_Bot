@@ -39,7 +39,7 @@ dp = Dispatcher(bot)
 # ---------------------------
 # DATABASE
 # ---------------------------
-db_path = os.path.join(os.getcwd(), 'data.db')
+db_path = os.getenv('DB_PATH', os.path.join(os.getcwd(), 'data.db'))
 conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
