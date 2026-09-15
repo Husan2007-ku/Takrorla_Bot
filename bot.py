@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+from gtts import gTTS
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils import executor
@@ -37,6 +38,11 @@ PROJECT_LINKS = [
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
+
+# Foydalanuvchi hozir bitta kartani tahrirlayaptimi — {user_id: card_id}.
+# Xotirada saqlanadi (DB'da emas): bot qayta ishga tushsa tozalanadi, bu xavfsiz —
+# foydalanuvchi shunchaki ✏️ tugmasini qayta bosadi.
+pending_edit = {}
 
 # ---------------------------
 # DATABASE
@@ -67,7 +73,8 @@ CREATE TABLE IF NOT EXISTS cards (
     interval_days INTEGER DEFAULT 1,
     reps INTEGER DEFAULT 0,
     due_date TEXT,
-    created_at TEXT
+    created_at TEXT,
+    category TEXT DEFAULT 'other'
 )
 """)
 
@@ -79,6 +86,15 @@ CREATE TABLE IF NOT EXISTS promo_messages (
 )
 """)
 conn.commit()
+
+# --- MIGRATSIYA: eski (category ustunisiz) bazalarga ustun qo'shish ---
+# Eslatma: bu mavjud qatorlarni O'CHIRMAYDI — faqat yangi ustun qo'shiladi,
+# eski kartalarning barchasi category='other' bilan davom etadi.
+try:
+    cursor.execute("ALTER TABLE cards ADD COLUMN category TEXT DEFAULT 'other'")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass  # ustun allaqachon mavjud
 
 
 def ensure_user(user: types.User, referred_by=None):
@@ -109,7 +125,7 @@ def main_menu():
     return kb
 
 
-def get_review_keyboard(card_id):
+def get_review_keyboard(card_id, category="other"):
     kb = InlineKeyboardMarkup(row_width=4)
     kb.add(
         InlineKeyboardButton("🔴 Again", callback_data=f"rate_again_{card_id}"),
@@ -117,18 +133,38 @@ def get_review_keyboard(card_id):
         InlineKeyboardButton("🟢 Good", callback_data=f"rate_good_{card_id}"),
         InlineKeyboardButton("🔵 Easy", callback_data=f"rate_easy_{card_id}"),
     )
+    # Talaffuz tugmasi FAQAT "til so'zi" deb belgilangan kartalarda ko'rinadi —
+    # tarix/matematika va h.k. umumiy kartalarda chiqmaydi.
+    if category == "lang":
+        kb.add(InlineKeyboardButton("🔊 Talaffuz", callback_data=f"pronounce_{card_id}"))
     return kb
 
 
-def get_delete_keyboard(card_id):
+def get_card_keyboard(card_id, category="other"):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🗑 O'chirish", callback_data=f"del_{card_id}"))
+    kb.add(
+        InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"edit_{card_id}"),
+        InlineKeyboardButton("🗑 O'chirish", callback_data=f"del_{card_id}"),
+    )
+    if category == "lang":
+        kb.add(InlineKeyboardButton("📚 Umumiy deb belgilash", callback_data=f"cat_other_{card_id}"))
+    else:
+        kb.add(InlineKeyboardButton("🗣 Til so'zi deb belgilash", callback_data=f"cat_lang_{card_id}"))
     return kb
 
 
 def projects_text():
     lines = [f"• [{name}]({url})" for name, url in PROJECT_LINKS]
     return "\n".join(lines)
+
+
+def extract_term(content):
+    """Talaffuz uchun kartadan so'z/iborani ajratib olish.
+    "abundant - mo'l-ko'l" kabi format bo'lsa, faqat "abundant" o'qiladi."""
+    for sep in (" - ", " — ", " – ", ":", "\n"):
+        if sep in content:
+            return content.split(sep, 1)[0].strip()
+    return content.strip()[:100]
 
 
 # ---------------------------
@@ -243,7 +279,7 @@ async def send_stats(user_id):
 
 async def send_card_list(user_id, limit=15):
     cursor.execute(
-        "SELECT id, content, due_date FROM cards WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        "SELECT id, content, due_date, category FROM cards WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, limit)
     )
     rows = cursor.fetchall()
@@ -252,17 +288,18 @@ async def send_card_list(user_id, limit=15):
         return
 
     await bot.send_message(user_id, f"📋 So'nggi {len(rows)} ta kartangiz:")
-    for card_id, content, due_date in rows:
+    for card_id, content, due_date, category in rows:
         preview = content if len(content) <= 200 else content[:200] + "…"
+        label = "🗣 Til so'zi" if category == "lang" else "📚 Umumiy"
         await bot.send_message(
             user_id,
-            f"🆔 {card_id} | 📅 keyingi: {due_date}\n{preview}",
-            reply_markup=get_delete_keyboard(card_id)
+            f"🆔 {card_id} | 📅 keyingi: {due_date} | {label}\n{preview}",
+            reply_markup=get_card_keyboard(card_id, category)
         )
 
 
 # ---------------------------
-# SAQLASH
+# SAQLASH / TAHRIRLASH
 # ---------------------------
 
 RESERVED_TEXTS = ("➕", "🔍", "📊", "📋")
@@ -274,19 +311,47 @@ async def save_content(message: types.Message):
     ensure_user(message.from_user)
 
     content = message.text
+
+    # Agar foydalanuvchi ✏️ Tahrirlash tugmasini bosgan bo'lsa — YANGI karta
+    # qo'shish o'rniga xuddi shu kartani yangilaymiz. Shu orqali eski (xato)
+    # matn bazada boshqa qator bo'lib qolib, alohida eslatilib yurishining oldi olinadi.
+    if user_id in pending_edit:
+        card_id = pending_edit.pop(user_id)
+        cursor.execute("SELECT category FROM cards WHERE id=? AND user_id=?", (card_id, user_id))
+        row = cursor.fetchone()
+        if row is None:
+            await message.reply("⚠️ Bu karta topilmadi (o'chirilgan bo'lishi mumkin). Yangi karta sifatida saqlanmadi — qaytadan urinib ko'ring.")
+            return
+        category = row[0] or "other"
+        cursor.execute("UPDATE cards SET content=? WHERE id=?", (content, card_id))
+        conn.commit()
+        await message.reply(
+            f"✏️ Karta #{card_id} yangilandi! Eslatma jadvali (keyingi sana) o'zgarmadi.",
+            reply_markup=main_menu()
+        )
+        await message.reply("Belgini tekshiring:", reply_markup=get_card_keyboard(card_id, category))
+        return
+
     due_date = (datetime.now(TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
     created_at = datetime.now(TZ).isoformat()
 
     cursor.execute(
-        "INSERT INTO cards (user_id, content, ease_factor, interval_days, reps, due_date, created_at) "
-        "VALUES (?, ?, 2.5, 1, 0, ?, ?)",
+        "INSERT INTO cards (user_id, content, ease_factor, interval_days, reps, due_date, created_at, category) "
+        "VALUES (?, ?, 2.5, 1, 0, ?, ?, 'other')",
         (user_id, content, due_date, created_at)
     )
     conn.commit()
+    new_card_id = cursor.lastrowid
 
     await message.reply(
         f"✅ Muvaffaqiyatli saqlandi!\n\n⏰ Birinchi takrorlash: {due_date}",
         reply_markup=main_menu()
+    )
+    # Faqat chet tili so'zlariga talaffuz (🔊) tugmasi qo'shiladi — shuning uchun
+    # har bir yangi kartadan turini so'raymiz. Javob bermasa "Umumiy" bo'lib qoladi.
+    await message.reply(
+        "Bu qanday ma'lumot? (faqat chet tili so'zlarida 🔊 talaffuz tugmasi chiqadi)",
+        reply_markup=get_card_keyboard(new_card_id, "other")
     )
 
 
@@ -297,7 +362,7 @@ async def save_content(message: types.Message):
 async def send_reviews(user_id):
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
     cursor.execute(
-        "SELECT id, content FROM cards WHERE user_id=? AND due_date<=? ORDER BY due_date ASC",
+        "SELECT id, content, category FROM cards WHERE user_id=? AND due_date<=? ORDER BY due_date ASC",
         (user_id, today_str)
     )
     rows = cursor.fetchall()
@@ -306,11 +371,11 @@ async def send_reviews(user_id):
         await bot.send_message(user_id, "📭 Hozircha takrorlash uchun ma'lumot yo'q. Yangi narsalar o'rganishda davom eting!")
         return
 
-    for card_id, content in rows:
+    for card_id, content, category in rows:
         await bot.send_message(
             user_id,
             f"📚 Takrorlash vaqti keldi!\n\n{content}",
-            reply_markup=get_review_keyboard(card_id)
+            reply_markup=get_review_keyboard(card_id, category)
         )
 
     await maybe_send_promo(user_id)
@@ -372,8 +437,90 @@ async def process_delete(callback_query: types.CallbackQuery):
     card_id = callback_query.data.split("_")[1]
     cursor.execute("DELETE FROM cards WHERE id=? AND user_id=?", (card_id, callback_query.from_user.id))
     conn.commit()
+    pending_edit.pop(callback_query.from_user.id, None)
     await callback_query.message.edit_text("🗑 O'chirildi.")
     await callback_query.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("edit_"))
+async def process_edit_request(callback_query: types.CallbackQuery):
+    card_id = callback_query.data.split("_", 1)[1]
+    cursor.execute("SELECT id FROM cards WHERE id=? AND user_id=?", (card_id, callback_query.from_user.id))
+    if cursor.fetchone() is None:
+        await callback_query.answer("Karta topilmadi.")
+        return
+    pending_edit[callback_query.from_user.id] = int(card_id)
+    await callback_query.answer()
+    await callback_query.message.reply(
+        f"✍️ #{card_id} uchun yangi matnni yuboring — shu karta yangilanadi, eskisi o'chib, yangisi yozilib qoladi."
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data and (c.data.startswith("cat_lang_") or c.data.startswith("cat_other_")))
+async def process_category_toggle(callback_query: types.CallbackQuery):
+    is_lang = callback_query.data.startswith("cat_lang_")
+    card_id = callback_query.data.split("_", 2)[2]
+    new_category = "lang" if is_lang else "other"
+
+    cursor.execute(
+        "SELECT content, due_date FROM cards WHERE id=? AND user_id=?",
+        (card_id, callback_query.from_user.id)
+    )
+    row = cursor.fetchone()
+    if row is None:
+        await callback_query.answer("Karta topilmadi.")
+        return
+
+    cursor.execute("UPDATE cards SET category=? WHERE id=?", (new_category, card_id))
+    conn.commit()
+
+    content, due_date = row
+    preview = content if len(content) <= 200 else content[:200] + "…"
+    label = "🗣 Til so'zi" if new_category == "lang" else "📚 Umumiy"
+    try:
+        await callback_query.message.edit_text(
+            f"🆔 {card_id} | 📅 keyingi: {due_date} | {label}\n{preview}",
+            reply_markup=get_card_keyboard(card_id, new_category)
+        )
+    except Exception:
+        pass  # (masalan "saqlandi" xabari ustida bo'lsa, matn formatidan farq qilishi mumkin)
+    await callback_query.answer("Belgi yangilandi.")
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("pronounce_"))
+async def process_pronounce(callback_query: types.CallbackQuery):
+    card_id = callback_query.data.split("_", 1)[1]
+    cursor.execute(
+        "SELECT content, category FROM cards WHERE id=? AND user_id=?",
+        (card_id, callback_query.from_user.id)
+    )
+    row = cursor.fetchone()
+    if row is None:
+        await callback_query.answer("Karta topilmadi.")
+        return
+
+    content, category = row
+    if category != "lang":
+        await callback_query.answer(
+            "🔊 Talaffuz faqat \"🗣 Til so'zi\" deb belgilangan kartalarda ishlaydi.",
+            show_alert=True
+        )
+        return
+
+    term = extract_term(content)
+    await callback_query.answer("🔊 Tayyorlanmoqda...")
+    try:
+        buf = io.BytesIO()
+        await asyncio.to_thread(gTTS(text=term, lang="en").write_to_fp, buf)
+        buf.seek(0)
+        await bot.send_audio(
+            callback_query.from_user.id,
+            types.InputFile(buf, filename="talaffuz.mp3"),
+            title=term
+        )
+    except Exception as e:
+        logging.error(f"TTS xatosi (karta {card_id}): {e}")
+        await bot.send_message(callback_query.from_user.id, "❌ Talaffuzni tayyorlashda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.")
 
 
 # ---------------------------
@@ -471,13 +618,13 @@ async def export_data(message: types.Message):
 
     # --- cards.csv ---
     cursor.execute(
-        "SELECT id, user_id, content, ease_factor, interval_days, reps, due_date, created_at FROM cards ORDER BY user_id, id"
+        "SELECT id, user_id, content, ease_factor, interval_days, reps, due_date, created_at, category FROM cards ORDER BY user_id, id"
     )
     cards_rows = cursor.fetchall()
 
     cards_buf = io.StringIO()
     writer = csv.writer(cards_buf)
-    writer.writerow(["id", "user_id", "content", "ease_factor", "interval_days", "reps", "due_date", "created_at"])
+    writer.writerow(["id", "user_id", "content", "ease_factor", "interval_days", "reps", "due_date", "created_at", "category"])
     writer.writerows(cards_rows)
     cards_bytes = io.BytesIO(cards_buf.getvalue().encode("utf-8-sig"))
     cards_bytes.name = "cards.csv"
