@@ -5,6 +5,7 @@ import random
 import asyncio
 import csv
 import io
+import aiohttp
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,17 @@ if not API_TOKEN:
 
 TZ = ZoneInfo("Asia/Tashkent")
 
+# --- AI Test funksiyasi (referral orqali ochiladigan) ---
+# Ikkala provider uchun ham alohida key saqlanadi — shunda AI_PROVIDER'ni
+# almashtirish uchun keylarni qayta kiritish shart emas.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").strip().lower()  # "groq" | "gemini"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+REFERRAL_MILESTONE_SIZE = 3      # necha ta FAOL taklif = 1 ochilish
+AI_ACCESS_DAYS_PER_MILESTONE = 30  # har ochilishda necha kunlik AI Test kirish beriladi
+
 # Husanning boshqa kanal/loyihalari — /start va promo-rotatsiyada ko'rsatiladi.
 # Yangi loyiha chiqqanda shu ro'yxatga qo'shib qo'ying.
 PROJECT_LINKS = [
@@ -43,6 +55,10 @@ dp = Dispatcher(bot)
 # Xotirada saqlanadi (DB'da emas): bot qayta ishga tushsa tozalanadi, bu xavfsiz —
 # foydalanuvchi shunchaki ✏️ tugmasini qayta bosadi.
 pending_edit = {}
+
+# Foydalanuvchi hozir AI Test jarayonidami — {user_id: {"queue": [...], "current": {...}, "correct": int, "total": int}}.
+# Xotirada saqlanadi: bot qayta ishga tushsa test to'xtaydi, foydalanuvchi qayta boshlaydi (xavfsiz, DB'ga ta'sir qilmaydi).
+active_ai_tests = {}
 
 # ---------------------------
 # DATABASE
@@ -60,7 +76,9 @@ CREATE TABLE IF NOT EXISTS users (
     reminder_hour INTEGER DEFAULT 9,
     referred_by INTEGER,
     last_reminder_date TEXT,
-    reviews_sent_count INTEGER DEFAULT 0
+    reviews_sent_count INTEGER DEFAULT 0,
+    ai_access_until TEXT,
+    ai_milestones_granted INTEGER DEFAULT 0
 )
 """)
 
@@ -87,14 +105,19 @@ CREATE TABLE IF NOT EXISTS promo_messages (
 """)
 conn.commit()
 
-# --- MIGRATSIYA: eski (category ustunisiz) bazalarga ustun qo'shish ---
-# Eslatma: bu mavjud qatorlarni O'CHIRMAYDI — faqat yangi ustun qo'shiladi,
-# eski kartalarning barchasi category='other' bilan davom etadi.
-try:
-    cursor.execute("ALTER TABLE cards ADD COLUMN category TEXT DEFAULT 'other'")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass  # ustun allaqachon mavjud
+# --- MIGRATSIYA: eski bazalarga yangi ustunlarni qo'shish ---
+# Eslatma: bular mavjud qatorlarni O'CHIRMAYDI — faqat yangi ustun qo'shiladi,
+# eski foydalanuvchi/kartalar o'zgarishsiz qoladi (default qiymatlar bilan).
+for alter_sql in (
+    "ALTER TABLE cards ADD COLUMN category TEXT DEFAULT 'other'",
+    "ALTER TABLE users ADD COLUMN ai_access_until TEXT",
+    "ALTER TABLE users ADD COLUMN ai_milestones_granted INTEGER DEFAULT 0",
+):
+    try:
+        cursor.execute(alter_sql)
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # ustun allaqachon mavjud
 
 
 def ensure_user(user: types.User, referred_by=None):
@@ -114,14 +137,124 @@ def is_admin(user_id):
 
 
 # ---------------------------
+# REFERRAL → AI TEST OCHILISHI
+# ---------------------------
+
+def count_activated_referrals(referrer_id):
+    """Referrer taklif qilgan, /start bosib KAMIDA 1 TA karta qo'shgan (ya'ni "faol") foydalanuvchilar soni."""
+    cursor.execute(
+        "SELECT COUNT(DISTINCT u.user_id) FROM users u "
+        "WHERE u.referred_by=? AND EXISTS (SELECT 1 FROM cards c WHERE c.user_id=u.user_id)",
+        (referrer_id,)
+    )
+    return cursor.fetchone()[0]
+
+
+def has_ai_access(user_id):
+    cursor.execute("SELECT ai_access_until FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return False
+    try:
+        return datetime.fromisoformat(row[0]) > datetime.now(TZ)
+    except ValueError:
+        return False
+
+
+async def check_and_grant_ai_access(referrer_id):
+    """Har REFERRAL_MILESTONE_SIZE ta yangi faol taklifga AI_ACCESS_DAYS_PER_MILESTONE kunlik
+    AI Test kirishi beriladi (mavjud muddat ustiga qo'shiladi). Idempotent — ortiqcha chaqirilsa
+    ham qayta mukofot bermaydi, chunki ai_milestones_granted allaqachon hisoblangan ulushni saqlaydi."""
+    if referrer_id is None:
+        return
+
+    cursor.execute("SELECT ai_milestones_granted, ai_access_until FROM users WHERE user_id=?", (referrer_id,))
+    row = cursor.fetchone()
+    if row is None:
+        return
+    granted, access_until_str = row
+    granted = granted or 0
+
+    activated_count = count_activated_referrals(referrer_id)
+    earned = activated_count // REFERRAL_MILESTONE_SIZE
+    new_milestones = earned - granted
+    if new_milestones <= 0:
+        return
+
+    now = datetime.now(TZ)
+    base = now
+    if access_until_str:
+        try:
+            existing = datetime.fromisoformat(access_until_str)
+            if existing > now:
+                base = existing
+        except ValueError:
+            pass
+    new_until = base + timedelta(days=AI_ACCESS_DAYS_PER_MILESTONE * new_milestones)
+
+    cursor.execute(
+        "UPDATE users SET ai_milestones_granted=?, ai_access_until=? WHERE user_id=?",
+        (earned, new_until.isoformat(), referrer_id)
+    )
+    conn.commit()
+
+    try:
+        await bot.send_message(
+            referrer_id,
+            f"🎉 Tabriklaymiz! Sizda hozir {activated_count} ta faol taklif bor.\n"
+            f"🧠 AI Test funksiyasi {new_until.strftime('%Y-%m-%d')} sanagacha ochildi!\n"
+            f"Boshlash uchun pastdagi \"🧠 AI Test\" tugmasi yoki /aitest."
+        )
+    except Exception as e:
+        logging.warning(f"AI-ochilish xabari yuborilmadi ({referrer_id}): {e}")
+
+
+async def ask_ai(system_prompt: str, user_prompt: str) -> str:
+    """Groq yoki Gemini'ga (AI_PROVIDER orqali tanlanadi) so'rov yuboradi va matn javobini qaytaradi."""
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        if AI_PROVIDER == "gemini":
+            if not GEMINI_API_KEY:
+                raise RuntimeError("GEMINI_API_KEY sozlanmagan (.env'ga qarang).")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            payload = {"contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}]}
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f"Gemini xato ({resp.status}): {data}")
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        else:  # groq — OpenAI-compatible API
+            if not GROQ_API_KEY:
+                raise RuntimeError("GROQ_API_KEY sozlanmagan (.env'ga qarang).")
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            payload = {
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 300,
+            }
+            async with session.post(url, json=payload, headers=headers) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f"Groq xato ({resp.status}): {data}")
+                return data["choices"][0]["message"]["content"].strip()
+
+
+# ---------------------------
 # TUGMALAR (MENYU)
 # ---------------------------
 
-def main_menu():
+def main_menu(user_id=None):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("➕ Yangi qo'shish"))
     kb.add(KeyboardButton("🔍 Bugun nima bor?"))
     kb.add(KeyboardButton("📊 Statistika"), KeyboardButton("📋 Kartalarim"))
+    if user_id is not None and has_ai_access(user_id):
+        kb.add(KeyboardButton("🧠 AI Test"))
     return kb
 
 
@@ -226,7 +359,7 @@ async def start(message: types.Message):
         f"Pastdagi menyu orqali boshlashingiz mumkin! 👇\n\n"
         f"📢 Mualliflik loyihalarim:\n{projects_text()}"
     )
-    await message.reply(intro_text, reply_markup=main_menu(), parse_mode="Markdown", disable_web_page_preview=True)
+    await message.reply(intro_text, reply_markup=main_menu(message.from_user.id), parse_mode="Markdown", disable_web_page_preview=True)
 
 
 # ---------------------------
@@ -251,6 +384,16 @@ async def stats_btn(message: types.Message):
 @dp.message_handler(lambda message: message.text == "📋 Kartalarim")
 async def list_btn(message: types.Message):
     await send_card_list(message.from_user.id)
+
+
+@dp.message_handler(lambda message: message.text == "🧠 AI Test")
+async def ai_test_btn(message: types.Message):
+    await start_ai_test(message.from_user.id)
+
+
+@dp.message_handler(commands=['aitest'])
+async def ai_test_cmd(message: types.Message):
+    await start_ai_test(message.from_user.id)
 
 
 # ---------------------------
@@ -299,10 +442,92 @@ async def send_card_list(user_id, limit=15):
 
 
 # ---------------------------
+# AI TEST (faqat 3 ta faol taklifdan keyin ochiladi)
+# ---------------------------
+
+async def start_ai_test(user_id):
+    if not has_ai_access(user_id):
+        activated = count_activated_referrals(user_id)
+        remaining = REFERRAL_MILESTONE_SIZE - (activated % REFERRAL_MILESTONE_SIZE)
+        bot_info = await bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+        await bot.send_message(
+            user_id,
+            f"🔒 AI Test hozircha yopiq.\n\n"
+            f"Ochish uchun {REFERRAL_MILESTONE_SIZE} kishini taklif qiling — ular /start bosib, "
+            f"kamida 1 ta ma'lumot qo'shishi kerak (shundagina \"faol\" hisoblanadi).\n\n"
+            f"✅ Hozirgi faol takliflaringiz: {activated}\n"
+            f"⏳ Keyingi ochilishgacha: {remaining} kishi\n\n"
+            f"🔗 Taklif havolangiz:\n{link}"
+        )
+        return
+
+    cursor.execute("SELECT id, content FROM cards WHERE user_id=? ORDER BY RANDOM() LIMIT 5", (user_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await bot.send_message(user_id, "📭 Hali kartangiz yo'q. Avval \"➕ Yangi qo'shish\" orqali ma'lumot kiriting, keyin test o'tkazamiz.")
+        return
+
+    active_ai_tests[user_id] = {"queue": rows, "current": None, "correct": 0, "total": len(rows)}
+    await bot.send_message(user_id, f"🧠 AI Test boshlandi! {len(rows)} ta savol. Har biriga o'z so'zlaringiz bilan, oddiy xabar sifatida javob bering.")
+    await send_next_ai_question(user_id)
+
+
+async def send_next_ai_question(user_id):
+    state = active_ai_tests.get(user_id)
+    if not state:
+        return
+    if not state["queue"]:
+        await bot.send_message(user_id, f"✅ Test tugadi! Natija: {state['correct']}/{state['total']}")
+        active_ai_tests.pop(user_id, None)
+        return
+
+    card_id, content = state["queue"].pop(0)
+    state["current"] = {"id": card_id, "content": content}
+    try:
+        question = await ask_ai(
+            "Sen o'zbek tilida ishlaydigan ta'lim yordamchisisan. Senga foydalanuvchi eslab qolmoqchi bo'lgan "
+            "bitta ma'lumot beriladi. Shu ma'lumot asosida uning yodda saqlaganini tekshiradigan QISQA (1 gap) "
+            "savol tuz. Javobning o'zini oshkor qilma. Faqat savol matnini yoz, boshqa hech narsa qo'shma.",
+            f"Ma'lumot: {content}"
+        )
+    except Exception as e:
+        logging.error(f"AI savol yaratishda xato (karta {card_id}): {e}")
+        question = f"Quyidagi ma'lumotni o'z so'zlaringiz bilan tushuntirib bering:\n{content}"
+
+    await bot.send_message(user_id, f"❓ {question}")
+
+
+async def handle_ai_test_answer(message: types.Message):
+    user_id = message.from_user.id
+    state = active_ai_tests[user_id]
+    current = state["current"]
+    state["current"] = None
+    user_answer = message.text
+
+    try:
+        evaluation = await ask_ai(
+            "Sen o'zbek tilida ishlaydigan mehribon o'qituvchisan. Foydalanuvchiga savol berilgan edi, u javob yozdi. "
+            "Asl ma'lumot bilan solishtirib bahola va 2-3 gapda o'zbek tilida qisqa fikr-mulohaza yoz. "
+            "Javobingni albatta '✅ To'g'ri' yoki '❌ Noto'g'ri' bilan boshla.",
+            f"Asl ma'lumot: {current['content']}\nFoydalanuvchi javobi: {user_answer}"
+        )
+    except Exception as e:
+        logging.error(f"AI baholashda xato (karta {current['id']}): {e}")
+        evaluation = f"⚠️ AI bahosi olinmadi.\nTo'g'ri ma'lumot: {current['content']}"
+
+    if evaluation.strip().startswith("✅"):
+        state["correct"] += 1
+
+    await message.reply(evaluation)
+    await send_next_ai_question(user_id)
+
+
+# ---------------------------
 # SAQLASH / TAHRIRLASH
 # ---------------------------
 
-RESERVED_TEXTS = ("➕", "🔍", "📊", "📋")
+RESERVED_TEXTS = ("➕", "🔍", "📊", "📋", "🧠")
 
 
 @dp.message_handler(lambda message: message.text and not message.text.startswith('/') and not message.text.startswith(RESERVED_TEXTS))
@@ -311,6 +536,12 @@ async def save_content(message: types.Message):
     ensure_user(message.from_user)
 
     content = message.text
+
+    # Foydalanuvchi hozir AI Test'da savolga javob bermoqchi bo'lsa — bu matnni
+    # yangi karta sifatida SAQLAMAYMIZ, balki test javobi sifatida qayta ishlaymiz.
+    if user_id in active_ai_tests and active_ai_tests[user_id].get("current"):
+        await handle_ai_test_answer(message)
+        return
 
     # Agar foydalanuvchi ✏️ Tahrirlash tugmasini bosgan bo'lsa — YANGI karta
     # qo'shish o'rniga xuddi shu kartani yangilaymiz. Shu orqali eski (xato)
@@ -327,7 +558,7 @@ async def save_content(message: types.Message):
         conn.commit()
         await message.reply(
             f"✏️ Karta #{card_id} yangilandi! Eslatma jadvali (keyingi sana) o'zgarmadi.",
-            reply_markup=main_menu()
+            reply_markup=main_menu(user_id)
         )
         await message.reply("Belgini tekshiring:", reply_markup=get_card_keyboard(card_id, category))
         return
@@ -345,7 +576,7 @@ async def save_content(message: types.Message):
 
     await message.reply(
         f"✅ Muvaffaqiyatli saqlandi!\n\n⏰ Birinchi takrorlash: {due_date}",
-        reply_markup=main_menu()
+        reply_markup=main_menu(user_id)
     )
     # Faqat chet tili so'zlariga talaffuz (🔊) tugmasi qo'shiladi — shuning uchun
     # har bir yangi kartadan turini so'raymiz. Javob bermasa "Umumiy" bo'lib qoladi.
@@ -353,6 +584,19 @@ async def save_content(message: types.Message):
         "Bu qanday ma'lumot? (faqat chet tili so'zlarida 🔊 talaffuz tugmasi chiqadi)",
         reply_markup=get_card_keyboard(new_card_id, "other")
     )
+
+    # "Faol taklif" hodisasi — bu foydalanuvchining ENG BIRINCHI kartasimi tekshiramiz.
+    # Agar shu odam kimningdir referral havolasi orqali kelgan bo'lsa va shu o'zining
+    # birinchi kartasi bo'lsa — bu taklif "faollashdi", taklif qilgan odamning
+    # AI Test hisobini yangilaymiz (har 3 taga 30 kun ochiladi).
+    cursor.execute("SELECT COUNT(*) FROM cards WHERE user_id=?", (user_id,))
+    total_cards = cursor.fetchone()[0]
+    if total_cards == 1:
+        cursor.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        referred_by = row[0] if row else None
+        if referred_by:
+            await check_and_grant_ai_access(referred_by)
 
 
 # ---------------------------
@@ -542,9 +786,17 @@ async def set_reminder_hour(message: types.Message):
 
 @dp.message_handler(commands=['invite'])
 async def invite(message: types.Message):
+    user_id = message.from_user.id
     bot_info = await bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=ref_{message.from_user.id}"
-    await message.reply(f"👥 Do'stlaringizni taklif qiling:\n{link}")
+    link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+    activated = count_activated_referrals(user_id)
+    remaining = REFERRAL_MILESTONE_SIZE - (activated % REFERRAL_MILESTONE_SIZE)
+    await message.reply(
+        f"👥 Do'stlaringizni taklif qiling:\n{link}\n\n"
+        f"✅ Faol takliflaringiz: {activated} (ular /start bosib, kamida 1 ta ma'lumot qo'shgan bo'lishi kerak)\n"
+        f"🧠 Har {REFERRAL_MILESTONE_SIZE} ta faol taklifga {AI_ACCESS_DAYS_PER_MILESTONE} kunlik AI Test ochiladi — "
+        f"keyingisigacha {remaining} kishi qoldi."
+    )
 
 
 @dp.message_handler(commands=['stats'])
@@ -661,8 +913,22 @@ async def hourly_scheduler():
         await asyncio.sleep(3600)  # har soatda tekshiradi
 
 
+async def backfill_ai_access():
+    """Bot birinchi marta shu (AI Test) versiyada ishga tushganda, ALLAQACHON 3+ faol
+    taklifga ega bo'lgan foydalanuvchilarni bir martalik tekshirib, ularga ham
+    AI Test kirishini ochib beradi (deploy vaqtidagi adolat uchun)."""
+    cursor.execute("SELECT DISTINCT referred_by FROM users WHERE referred_by IS NOT NULL")
+    referrer_ids = [r[0] for r in cursor.fetchall()]
+    for referrer_id in referrer_ids:
+        try:
+            await check_and_grant_ai_access(referrer_id)
+        except Exception as e:
+            logging.error(f"Backfill AI-access xatosi ({referrer_id}): {e}")
+
+
 async def on_startup(_):
     asyncio.create_task(hourly_scheduler())
+    asyncio.create_task(backfill_ai_access())
 
 
 # ---------------------------
