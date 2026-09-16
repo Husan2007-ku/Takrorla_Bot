@@ -180,6 +180,8 @@ def count_activated_referrals(referrer_id):
 
 
 def has_ai_access(user_id):
+    if is_admin(user_id):
+        return True  # admin (Husan) uchun AI Test har doim ochiq — referral talab qilinmaydi
     cursor.execute("SELECT ai_access_until FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
     if not row or not row[0]:
