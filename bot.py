@@ -5,6 +5,7 @@ import random
 import asyncio
 import csv
 import io
+import json
 import aiohttp
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -41,8 +42,11 @@ TZ = ZoneInfo("Asia/Tashkent")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").strip().lower()  # "groq" | "gemini"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Groq modellari tez-tez eskirib/o'chirilib turadi (masalan llama-3.1-8b-instant 2026-yilda
+# o'chirilgan). Asosiy model "model_not_found" bersa, shu ro'yxatdagi keyingisi avtomatik sinaladi.
+GROQ_FALLBACK_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 REFERRAL_MILESTONE_SIZE = 3      # necha ta FAOL taklif = 1 ochilish
 AI_ACCESS_DAYS_PER_MILESTONE = 30  # har ochilishda necha kunlik AI Test kirish beriladi
 
@@ -261,20 +265,26 @@ async def ask_ai(system_prompt: str, user_prompt: str) -> str:
                 raise RuntimeError("GROQ_API_KEY sozlanmagan (.env'ga qarang).")
             url = "https://api.groq.com/openai/v1/chat/completions"
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            payload = {
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.4,
-                "max_tokens": 300,
-            }
-            async with session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
-                if resp.status != 200:
-                    raise RuntimeError(f"Groq xato ({resp.status}): {data}")
-                return data["choices"][0]["message"]["content"].strip()
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+
+            # Asosiy model + fallback'lar (dublikatsiz, tartib saqlangan holda)
+            models_to_try = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
+            last_error = None
+            for model in models_to_try:
+                payload = {"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 300}
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        return data["choices"][0]["message"]["content"].strip()
+                    last_error = RuntimeError(f"Groq xato ({resp.status}, model={model}): {data}")
+                    error_code = (data.get("error") or {}).get("code")
+                    if error_code != "model_not_found":
+                        raise last_error  # boshqa turdagi xato (masalan noto'g'ri key) — darhol to'xtatamiz
+                    logging.warning(f"Groq modeli topilmadi ({model}), keyingi fallback sinaladi...")
+            raise last_error
 
 
 # ---------------------------
@@ -478,6 +488,28 @@ async def send_card_list(user_id, limit=15):
 # AI TEST (faqat 3 ta faol taklifdan keyin ochiladi)
 # ---------------------------
 
+AI_TEST_MODES = {
+    "quiz": "📝 Quiz (variantli savollar)",
+    "card": "🎴 Kartochka (o'zim eslayman, keyin javobni ochaman)",
+    "written": "✍️ Yozma (o'z so'zim bilan javob beraman, AI baholaydi)",
+}
+
+
+def ai_mode_keyboard():
+    kb = InlineKeyboardMarkup(row_width=1)
+    for mode, label in AI_TEST_MODES.items():
+        kb.add(InlineKeyboardButton(label, callback_data=f"aimode_{mode}"))
+    return kb
+
+
+def quiz_keyboard(options):
+    kb = InlineKeyboardMarkup(row_width=1)
+    letters = ["A", "B", "C", "D"]
+    for i, opt in enumerate(options):
+        kb.add(InlineKeyboardButton(f"{letters[i]}) {opt}", callback_data=f"quizans_{i}"))
+    return kb
+
+
 async def start_ai_test(user_id):
     if not has_ai_access(user_id):
         activated = count_activated_referrals(user_id)
@@ -495,18 +527,44 @@ async def start_ai_test(user_id):
         )
         return
 
-    cursor.execute("SELECT id, content FROM cards WHERE user_id=? ORDER BY RANDOM() LIMIT 5", (user_id,))
-    rows = cursor.fetchall()
-    if not rows:
+    cursor.execute("SELECT COUNT(*) FROM cards WHERE user_id=?", (user_id,))
+    if cursor.fetchone()[0] == 0:
         await bot.send_message(user_id, "📭 Hali kartangiz yo'q. Avval \"➕ Yangi qo'shish\" orqali ma'lumot kiriting, keyin test o'tkazamiz.")
         return
 
-    active_ai_tests[user_id] = {"queue": rows, "current": None, "correct": 0, "total": len(rows)}
-    await bot.send_message(user_id, f"🧠 AI Test boshlandi! {len(rows)} ta savol. Har biriga o'z so'zlaringiz bilan, oddiy xabar sifatida javob bering.")
+    await bot.send_message(
+        user_id,
+        "🧠 O'rgangan narsalaringizni mustahkamlashda 3 usulda yordam bera olaman:\n\n"
+        "📝 Quiz — variantli savollar (A/B/C/D dan birini tanlaysiz)\n"
+        "🎴 Kartochka — ipuchi beraman, o'zingiz eslaysiz, keyin javobni ochaman\n"
+        "✍️ Yozma — savolga o'z so'zingiz bilan yozma javob berasiz, AI baholaydi\n\n"
+        "Qaysi birini xohlaysiz?",
+        reply_markup=ai_mode_keyboard()
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("aimode_"))
+async def process_ai_mode_choice(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    mode = callback_query.data.split("_", 1)[1]
+    if mode not in AI_TEST_MODES:
+        await callback_query.answer("Noma'lum usul.")
+        return
+
+    cursor.execute("SELECT id, content FROM cards WHERE user_id=? ORDER BY RANDOM() LIMIT 5", (user_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await callback_query.answer("Kartangiz topilmadi.")
+        return
+
+    active_ai_tests[user_id] = {"mode": mode, "queue": rows, "current": None, "correct": 0, "total": len(rows)}
+    await callback_query.message.edit_text(f"{AI_TEST_MODES[mode]} tanlandi. {len(rows)} ta savol bo'ladi.")
+    await callback_query.answer()
     await send_next_ai_question(user_id)
 
 
 async def send_next_ai_question(user_id):
+    """Har uchala rejim uchun ham navbatdagi kartani tanlab, tegishli funksiyaga yo'naltiradi."""
     state = active_ai_tests.get(user_id)
     if not state:
         return
@@ -516,6 +574,19 @@ async def send_next_ai_question(user_id):
         return
 
     card_id, content = state["queue"].pop(0)
+    mode = state["mode"]
+    if mode == "quiz":
+        await send_quiz_question(user_id, card_id, content)
+    elif mode == "card":
+        await send_flashcard_question(user_id, card_id, content)
+    else:
+        await send_written_question(user_id, card_id, content)
+
+
+# --- ✍️ Yozma rejim ---
+
+async def send_written_question(user_id, card_id, content):
+    state = active_ai_tests[user_id]
     state["current"] = {"id": card_id, "content": content}
     try:
         question = await ask_ai(
@@ -556,6 +627,135 @@ async def handle_ai_test_answer(message: types.Message):
     await send_next_ai_question(user_id)
 
 
+# --- 📝 Quiz rejimi ---
+
+async def generate_quiz_question(content):
+    """AI'dan qat'iy JSON formatida 4 variantli savol so'raydi.
+    Format buzilgan bo'lsa None qaytaradi — chaqiruvchi yozma rejimga fallback qiladi."""
+    try:
+        raw = await ask_ai(
+            "Sen o'zbek tilida test tuzuvchi yordamchisan. Senga ma'lumot beriladi. Shu ma'lumot asosida "
+            "4 variantli (faqat BITTA to'g'ri, qolgan 3 tasi mantiqan yaqin lekin noto'g'ri) savol tuz. "
+            "FAQAT quyidagi JSON formatida javob qaytar, boshqa hech qanday matn, izoh yoki ``` belgisi qo'shma:\n"
+            '{"question": "...", "options": ["...", "...", "...", "..."], "correct_index": 0}',
+            f"Ma'lumot: {content}"
+        )
+        raw = raw.strip().strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        data = json.loads(raw)
+        options = data["options"]
+        correct_index = int(data["correct_index"])
+        if not isinstance(options, list) or len(options) != 4 or not (0 <= correct_index < 4):
+            return None
+        return {"question": str(data["question"]), "options": [str(o) for o in options], "correct_index": correct_index}
+    except Exception as e:
+        logging.error(f"Quiz JSON parse xatosi: {e}")
+        return None
+
+
+async def send_quiz_question(user_id, card_id, content):
+    quiz = await generate_quiz_question(content)
+    if quiz is None:
+        # AI to'g'ri JSON qaytarmadi — foydalanuvchi testi uzilib qolmasin, shu savolni yozma rejimda beramiz.
+        await send_written_question(user_id, card_id, content)
+        return
+
+    state = active_ai_tests[user_id]
+    state["current"] = {
+        "id": card_id,
+        "content": content,
+        "correct_index": quiz["correct_index"],
+        "options": quiz["options"],
+    }
+    await bot.send_message(user_id, f"📝 {quiz['question']}", reply_markup=quiz_keyboard(quiz["options"]))
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("quizans_"))
+async def process_quiz_answer(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    state = active_ai_tests.get(user_id)
+    if not state or not state.get("current"):
+        await callback_query.answer("Bu test allaqachon tugagan.")
+        return
+
+    chosen_index = int(callback_query.data.split("_", 1)[1])
+    current = state.pop("current")
+    correct_index = current["correct_index"]
+    options = current["options"]
+    letters = ["A", "B", "C", "D"]
+
+    if chosen_index == correct_index:
+        state["correct"] += 1
+        result_text = f"✅ To'g'ri! Javob: {letters[correct_index]}) {options[correct_index]}"
+    else:
+        result_text = (
+            f"❌ Noto'g'ri. Siz tanladingiz: {letters[chosen_index]}) {options[chosen_index]}\n"
+            f"To'g'ri javob: {letters[correct_index]}) {options[correct_index]}"
+        )
+
+    await callback_query.message.edit_text(result_text)
+    await callback_query.answer()
+    await send_next_ai_question(user_id)
+
+
+# --- 🎴 Kartochka rejimi ---
+
+async def send_flashcard_question(user_id, card_id, content):
+    try:
+        hint = await ask_ai(
+            "Sen o'zbek tilida ishlaydigan ta'lim yordamchisisan. Senga ma'lumot beriladi. Shu ma'lumotni "
+            "ESLAB QOLISHNI tekshiradigan QISQA (1 gap) ipuchi/savol yoz. Javobning o'zini yozma. "
+            "Faqat shu ipuchi matnini yoz, boshqa hech narsa qo'shma.",
+            f"Ma'lumot: {content}"
+        )
+    except Exception as e:
+        logging.error(f"Kartochka ipuchi xatosi (karta {card_id}): {e}")
+        hint = "Bu ma'lumotni eslay olasizmi?"
+
+    state = active_ai_tests[user_id]
+    state["current"] = {"id": card_id, "content": content}
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("👁 Javobni ko'rsatish", callback_data="flip_card"))
+    await bot.send_message(user_id, f"🎴 {hint}", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data == "flip_card")
+async def process_flip_card(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    state = active_ai_tests.get(user_id)
+    if not state or not state.get("current"):
+        await callback_query.answer("Bu test allaqachon tugagan.")
+        return
+
+    content = state["current"]["content"]
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Bilardim", callback_data="selfrate_yes"),
+        InlineKeyboardButton("❌ Bilmadim", callback_data="selfrate_no"),
+    )
+    await callback_query.message.edit_text(f"📖 Javob: {content}", reply_markup=kb)
+    await callback_query.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("selfrate_"))
+async def process_selfrate(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    state = active_ai_tests.get(user_id)
+    if not state or not state.get("current"):
+        await callback_query.answer("Bu test allaqachon tugagan.")
+        return
+
+    knew_it = callback_query.data.endswith("_yes")
+    state.pop("current")
+    if knew_it:
+        state["correct"] += 1
+
+    await callback_query.message.edit_text("✅ Belgilandi." if knew_it else "❌ Belgilandi — yana takrorlang.")
+    await callback_query.answer()
+    await send_next_ai_question(user_id)
+
+
 # ---------------------------
 # SAQLASH / TAHRIRLASH
 # ---------------------------
@@ -570,9 +770,11 @@ async def save_content(message: types.Message):
 
     content = message.text
 
-    # Foydalanuvchi hozir AI Test'da savolga javob bermoqchi bo'lsa — bu matnni
-    # yangi karta sifatida SAQLAMAYMIZ, balki test javobi sifatida qayta ishlaymiz.
-    if user_id in active_ai_tests and active_ai_tests[user_id].get("current"):
+    # Foydalanuvchi hozir "✍️ Yozma" AI Test rejimida savolga javob bermoqchi bo'lsa —
+    # bu matnni yangi karta sifatida SAQLAMAYMIZ, balki test javobi sifatida qayta ishlaymiz.
+    # (Quiz/Kartochka rejimlari tugma orqali ishlaydi, matn kutmaydi.)
+    active_test = active_ai_tests.get(user_id)
+    if active_test and active_test.get("mode") == "written" and active_test.get("current"):
         await handle_ai_test_answer(message)
         return
 
