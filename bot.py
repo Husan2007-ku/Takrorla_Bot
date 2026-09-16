@@ -103,6 +103,18 @@ CREATE TABLE IF NOT EXISTS promo_messages (
     active INTEGER DEFAULT 1
 )
 """)
+
+# /broadcast orqali kimga, qaysi xabar (message_id) yuborilganini saqlaydi —
+# xato ketsa /undo_broadcast bilan bekor qilish (o'chirish) uchun kerak.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS broadcast_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    broadcast_id TEXT,
+    user_id INTEGER,
+    message_id INTEGER,
+    sent_at TEXT
+)
+""")
 conn.commit()
 
 # --- MIGRATSIYA: eski bazalarga yangi ustunlarni qo'shish ---
@@ -818,18 +830,73 @@ async def broadcast(message: types.Message):
         await message.reply("Foydalanish: /broadcast Xabar matni")
         return
 
+    # Telegram baribir 48 soatdan eski xabarni o'chirishga ruxsat bermaydi —
+    # shuning uchun jadvalni cheksiz kattalashtirmaslik uchun eskilarini tozalaymiz.
+    cutoff = (datetime.now(TZ) - timedelta(hours=48)).isoformat()
+    cursor.execute("DELETE FROM broadcast_log WHERE sent_at < ?", (cutoff,))
+    conn.commit()
+
+    broadcast_id = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
+    sent_at = datetime.now(TZ).isoformat()
     cursor.execute("SELECT user_id FROM users")
     user_ids = [r[0] for r in cursor.fetchall()]
     sent, failed = 0, 0
     for uid in user_ids:
         try:
-            await bot.send_message(uid, text, disable_web_page_preview=True)
+            sent_msg = await bot.send_message(uid, text, disable_web_page_preview=True)
+            cursor.execute(
+                "INSERT INTO broadcast_log (broadcast_id, user_id, message_id, sent_at) VALUES (?, ?, ?, ?)",
+                (broadcast_id, uid, sent_msg.message_id, sent_at)
+            )
             sent += 1
         except Exception as e:
             failed += 1
             logging.warning(f"Broadcast xato ({uid}): {e}")
         await asyncio.sleep(0.05)  # Telegram rate-limit'ga tegmaslik uchun
-    await message.reply(f"✅ Yuborildi: {sent} | ❌ Xato: {failed}")
+    conn.commit()
+    await message.reply(
+        f"✅ Yuborildi: {sent} | ❌ Xato: {failed}\n"
+        f"🆔 ID: {broadcast_id}\n"
+        f"Xato ketsa (48 soat ichida): /undo_broadcast {broadcast_id}"
+    )
+
+
+@dp.message_handler(commands=['undo_broadcast'])
+async def undo_broadcast(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    broadcast_id = message.get_args().strip()
+    if not broadcast_id:
+        cursor.execute("SELECT broadcast_id FROM broadcast_log ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        if row is None:
+            await message.reply("Bekor qilinadigan broadcast topilmadi (yo yuborilmagan, yo 48 soatdan oshgan).")
+            return
+        broadcast_id = row[0]
+
+    cursor.execute("SELECT user_id, message_id FROM broadcast_log WHERE broadcast_id=?", (broadcast_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await message.reply(f"'{broadcast_id}' ID'li broadcast topilmadi.")
+        return
+
+    deleted, failed = 0, 0
+    for uid, msg_id in rows:
+        try:
+            await bot.delete_message(uid, msg_id)
+            deleted += 1
+        except Exception as e:
+            failed += 1
+            logging.warning(f"O'chirib bo'lmadi ({uid}, msg {msg_id}): {e}")
+        await asyncio.sleep(0.05)
+
+    cursor.execute("DELETE FROM broadcast_log WHERE broadcast_id=?", (broadcast_id,))
+    conn.commit()
+    await message.reply(
+        f"🗑 Bekor qilindi: {deleted} | ❌ O'chmadi: {failed}\n"
+        f"(Telegram faqat 48 soat ichidagi xabarlarni o'chirtiradi — shundan oshgani \"O'chmadi\"ga tushadi)"
+    )
 
 
 @dp.message_handler(commands=['admin_stats'])
