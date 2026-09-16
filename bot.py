@@ -14,6 +14,11 @@ from gtts import gTTS
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils import executor
+from aiogram.utils.exceptions import BotBlocked, UserDeactivated, ChatNotFound
+
+# Foydalanuvchi botni bloklagani/akkountini o'chirgani aniqlanadigan xatolar —
+# shu turdagi xato kelsa, xabar yubormay qo'yish o'rniga is_blocked=1 deb belgilaymiz.
+BLOCKED_EXCEPTIONS = (BotBlocked, UserDeactivated, ChatNotFound)
 
 # ---------------------------
 # KONFIGURATSIYA
@@ -78,7 +83,8 @@ CREATE TABLE IF NOT EXISTS users (
     last_reminder_date TEXT,
     reviews_sent_count INTEGER DEFAULT 0,
     ai_access_until TEXT,
-    ai_milestones_granted INTEGER DEFAULT 0
+    ai_milestones_granted INTEGER DEFAULT 0,
+    is_blocked INTEGER DEFAULT 0
 )
 """)
 
@@ -124,6 +130,7 @@ for alter_sql in (
     "ALTER TABLE cards ADD COLUMN category TEXT DEFAULT 'other'",
     "ALTER TABLE users ADD COLUMN ai_access_until TEXT",
     "ALTER TABLE users ADD COLUMN ai_milestones_granted INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0",
 ):
     try:
         cursor.execute(alter_sql)
@@ -141,11 +148,21 @@ def ensure_user(user: types.User, referred_by=None):
         )
         conn.commit()
         return True  # yangi foydalanuvchi
+    # Foydalanuvchi bizga xabar yozgani — demak botni bloklamagan. Oldin bloklangan
+    # deb belgilangan bo'lsa, shu yerda tozalaymiz (faqat kerak bo'lsagina yozamiz).
+    cursor.execute("UPDATE users SET is_blocked=0 WHERE user_id=? AND is_blocked=1", (user.id,))
+    if cursor.rowcount:
+        conn.commit()
     return False
 
 
 def is_admin(user_id):
     return ADMIN_ID is not None and user_id == ADMIN_ID
+
+
+def mark_user_blocked(user_id, blocked=True):
+    cursor.execute("UPDATE users SET is_blocked=? WHERE user_id=?", (1 if blocked else 0, user_id))
+    conn.commit()
 
 
 # ---------------------------
@@ -217,6 +234,8 @@ async def check_and_grant_ai_access(referrer_id):
             f"🧠 AI Test funksiyasi {new_until.strftime('%Y-%m-%d')} sanagacha ochildi!\n"
             f"Boshlash uchun pastdagi \"🧠 AI Test\" tugmasi yoki /aitest."
         )
+    except BLOCKED_EXCEPTIONS:
+        mark_user_blocked(referrer_id, True)
     except Exception as e:
         logging.warning(f"AI-ochilish xabari yuborilmadi ({referrer_id}): {e}")
 
@@ -628,11 +647,15 @@ async def send_reviews(user_id):
         return
 
     for card_id, content, category in rows:
-        await bot.send_message(
-            user_id,
-            f"📚 Takrorlash vaqti keldi!\n\n{content}",
-            reply_markup=get_review_keyboard(card_id, category)
-        )
+        try:
+            await bot.send_message(
+                user_id,
+                f"📚 Takrorlash vaqti keldi!\n\n{content}",
+                reply_markup=get_review_keyboard(card_id, category)
+            )
+        except BLOCKED_EXCEPTIONS:
+            mark_user_blocked(user_id, True)
+            return  # bloklagan foydalanuvchiga qolgan kartalarni ham yuborishga urinmaymiz
 
     await maybe_send_promo(user_id)
 
@@ -840,22 +863,26 @@ async def broadcast(message: types.Message):
     sent_at = datetime.now(TZ).isoformat()
     cursor.execute("SELECT user_id FROM users")
     user_ids = [r[0] for r in cursor.fetchall()]
-    sent, failed = 0, 0
+    sent, blocked, failed = 0, 0, 0
     for uid in user_ids:
         try:
             sent_msg = await bot.send_message(uid, text, disable_web_page_preview=True)
+        except BLOCKED_EXCEPTIONS:
+            mark_user_blocked(uid, True)
+            blocked += 1
+        except Exception as e:
+            failed += 1
+            logging.warning(f"Broadcast xato ({uid}): {e}")
+        else:
             cursor.execute(
                 "INSERT INTO broadcast_log (broadcast_id, user_id, message_id, sent_at) VALUES (?, ?, ?, ?)",
                 (broadcast_id, uid, sent_msg.message_id, sent_at)
             )
             sent += 1
-        except Exception as e:
-            failed += 1
-            logging.warning(f"Broadcast xato ({uid}): {e}")
         await asyncio.sleep(0.05)  # Telegram rate-limit'ga tegmaslik uchun
     conn.commit()
     await message.reply(
-        f"✅ Yuborildi: {sent} | ❌ Xato: {failed}\n"
+        f"✅ Yuborildi: {sent} | 🚫 Bloklagan: {blocked} | ❌ Boshqa xato: {failed}\n"
         f"🆔 ID: {broadcast_id}\n"
         f"Xato ketsa (48 soat ichida): /undo_broadcast {broadcast_id}"
     )
@@ -910,9 +937,12 @@ async def admin_stats(message: types.Message):
     new_today = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM cards")
     total_cards = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM users WHERE is_blocked=1")
+    blocked_count = cursor.fetchone()[0]
     await message.reply(
         f"👥 Jami foydalanuvchi: {total_users}\n"
         f"🆕 Bugun qo'shilgan: {new_today}\n"
+        f"🚫 Botni bloklaganlar: {blocked_count}\n"
         f"🗂 Jami karta: {total_cards}"
     )
 
