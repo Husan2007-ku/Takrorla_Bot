@@ -49,6 +49,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 GROQ_FALLBACK_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 REFERRAL_MILESTONE_SIZE = 3      # necha ta FAOL taklif = 1 ochilish
 AI_ACCESS_DAYS_PER_MILESTONE = 30  # har ochilishda necha kunlik AI Test kirish beriladi
+AI_PROMPT_MAX_CHARS = 800  # juda uzun karta (masalan ko'chirib tashlangan katta matn) AI'ni chalkashtirmasin
 
 # Husanning boshqa kanal/loyihalari — /start va promo-rotatsiyada ko'rsatiladi.
 # Yangi loyiha chiqqanda shu ro'yxatga qo'shib qo'ying.
@@ -334,6 +335,15 @@ def projects_text():
     return "\n".join(lines)
 
 
+def truncate_for_ai(content):
+    """AI promptiga yuboriladigan matnni cheklaydi — juda uzun karta (masalan ko'p xabar
+    ko'chirib tashlangan) AI'ni chalkashtirib, bo'sh/g'alati javob qaytarishining oldini oladi."""
+    content = content.strip()
+    if len(content) <= AI_PROMPT_MAX_CHARS:
+        return content
+    return content[:AI_PROMPT_MAX_CHARS] + "..."
+
+
 def extract_term(content):
     """Talaffuz uchun kartadan so'z/iborani ajratib olish.
     "abundant - mo'l-ko'l" kabi format bo'lsa, faqat "abundant" o'qiladi."""
@@ -593,8 +603,11 @@ async def send_written_question(user_id, card_id, content):
             "Sen o'zbek tilida ishlaydigan ta'lim yordamchisisan. Senga foydalanuvchi eslab qolmoqchi bo'lgan "
             "bitta ma'lumot beriladi. Shu ma'lumot asosida uning yodda saqlaganini tekshiradigan QISQA (1 gap) "
             "savol tuz. Javobning o'zini oshkor qilma. Faqat savol matnini yoz, boshqa hech narsa qo'shma.",
-            f"Ma'lumot: {content}"
+            f"Ma'lumot: {truncate_for_ai(content)}"
         )
+        question = (question or "").strip()
+        if not question:
+            raise ValueError("AI bo'sh javob qaytardi")
     except Exception as e:
         logging.error(f"AI savol yaratishda xato (karta {card_id}): {e}")
         question = f"Quyidagi ma'lumotni o'z so'zlaringiz bilan tushuntirib bering:\n{content}"
@@ -614,7 +627,7 @@ async def handle_ai_test_answer(message: types.Message):
             "Sen o'zbek tilida ishlaydigan mehribon o'qituvchisan. Foydalanuvchiga savol berilgan edi, u javob yozdi. "
             "Asl ma'lumot bilan solishtirib bahola va 2-3 gapda o'zbek tilida qisqa fikr-mulohaza yoz. "
             "Javobingni albatta '✅ To'g'ri' yoki '❌ Noto'g'ri' bilan boshla.",
-            f"Asl ma'lumot: {current['content']}\nFoydalanuvchi javobi: {user_answer}"
+            f"Asl ma'lumot: {truncate_for_ai(current['content'])}\nFoydalanuvchi javobi: {user_answer}"
         )
     except Exception as e:
         logging.error(f"AI baholashda xato (karta {current['id']}): {e}")
@@ -638,17 +651,21 @@ async def generate_quiz_question(content):
             "4 variantli (faqat BITTA to'g'ri, qolgan 3 tasi mantiqan yaqin lekin noto'g'ri) savol tuz. "
             "FAQAT quyidagi JSON formatida javob qaytar, boshqa hech qanday matn, izoh yoki ``` belgisi qo'shma:\n"
             '{"question": "...", "options": ["...", "...", "...", "..."], "correct_index": 0}',
-            f"Ma'lumot: {content}"
+            f"Ma'lumot: {truncate_for_ai(content)}"
         )
         raw = raw.strip().strip("`").strip()
         if raw.lower().startswith("json"):
             raw = raw[4:].strip()
         data = json.loads(raw)
+        question_text = str(data.get("question") or "").strip()
         options = data["options"]
         correct_index = int(data["correct_index"])
-        if not isinstance(options, list) or len(options) != 4 or not (0 <= correct_index < 4):
+        if not question_text or not isinstance(options, list) or len(options) != 4 or not (0 <= correct_index < 4):
             return None
-        return {"question": str(data["question"]), "options": [str(o) for o in options], "correct_index": correct_index}
+        options = [str(o).strip() for o in options]
+        if any(not o for o in options):
+            return None
+        return {"question": question_text, "options": options, "correct_index": correct_index}
     except Exception as e:
         logging.error(f"Quiz JSON parse xatosi: {e}")
         return None
@@ -707,8 +724,11 @@ async def send_flashcard_question(user_id, card_id, content):
             "Sen o'zbek tilida ishlaydigan ta'lim yordamchisisan. Senga ma'lumot beriladi. Shu ma'lumotni "
             "ESLAB QOLISHNI tekshiradigan QISQA (1 gap) ipuchi/savol yoz. Javobning o'zini yozma. "
             "Faqat shu ipuchi matnini yoz, boshqa hech narsa qo'shma.",
-            f"Ma'lumot: {content}"
+            f"Ma'lumot: {truncate_for_ai(content)}"
         )
+        hint = (hint or "").strip()
+        if not hint:
+            raise ValueError("AI bo'sh javob qaytardi")
     except Exception as e:
         logging.error(f"Kartochka ipuchi xatosi (karta {card_id}): {e}")
         hint = "Bu ma'lumotni eslay olasizmi?"
